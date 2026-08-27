@@ -3,30 +3,6 @@ import Combine
 
 
 
-
-extension Dictionary 
-{
-	mutating func syncKeys(to keys: [Key], makeValue: (Key) -> Value) 
-	{
-		let keySet = Set(keys)
-		removeAll { key,value in !keySet.contains(key) }
-		for key in keys where self[key] == nil 
-		{
-			self[key] = makeValue(key)
-		}
-	}
-	
-	mutating func removeAll(where filter: (Key, Value) -> Bool)
-	{
-		for (key, value) in self where filter(key, value)
-		{
-			removeValue(forKey: key)
-		}
-	}
-}
-
-
-
 //	store each file url by a key which may have some additional cache
 //	that we only want to generate once. eg. parse filename to some CSV meta
 public protocol UrlCacheKey : Hashable
@@ -47,14 +23,14 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 	private var monitor : DispatchSourceFileSystemObject? = nil
 	
 	
-	var urlsWithKeys : [UrlKey:URL]		{	return urlCache ?? scan()	}
-	var urls : [URL]					{	Array(urlsWithKeys.values)	}
-	var urlKeys : Set<UrlKey>			{	Set(urlsWithKeys.keys)	}
+	public var urlsWithKeys : [UrlKey:URL]	{	return urlCache ?? ReadDirectory()	}
+	public var urls : [URL]					{	Array(urlsWithKeys.values)	}
+	public var urlKeys : Set<UrlKey>		{	Set(urlsWithKeys.keys)	}
 
-
-	public init(directoryUrl: URL)
+	public init(directoryUrl: URL) throws
 	{
 		self.directoryUrl = directoryUrl
+		try StartMonitoringIfNeeded()
 	}
 
 	public func GetCachedFileUrl(key:UrlKey) -> URL?
@@ -67,9 +43,9 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 		directoryUrl.appendingPathComponent("\(key.filename).\(key.fileExtension)")
 	}
 
-	/// Append a URL that we know has just been written, without triggering a
-	/// full re-scan. Removes any existing entry with the same path first.
-	func append(_ url: URL)
+	//	Append a URL that we know has just been written, without triggering a
+	//	full re-scan. Removes any existing entry with the same path first.
+	func OnFileWritten(_ url: URL)
 	{
 		//	we drop those that return a nil key
 		guard let key = UrlKey(fileUrl: url) else
@@ -77,11 +53,11 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 			return
 		}
 		urlCache?.updateValue( url, forKey: key)
-		startMonitoringIfNeeded()
 	}
 
 	// Remove URLs that we know have just been deleted, without triggering a full re-scan.
-	func OnFilesDeleted(urls:[URL])
+	//	note: auto-update-scanner should detect this itself
+	public func OnFilesDeleted(urls:[URL])
 	{
 		urlCache?.removeAll
 		{
@@ -91,17 +67,15 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 	}
 
 	
-	/// Drop the entire cached list. The next call to `urls()` will re-scan.
-	func invalidate()
+	//	Drop the entire cached list. The next call to `urls()` will re-scan.
+	func OnFileWrittenDeletedOrRenamed()
 	{
 		urlCache = nil
 	}
 
 
-	private func scan() -> [UrlKey:URL]
+	private func ReadDirectory() -> [UrlKey:URL]
 	{
-		startMonitoringIfNeeded()
-
 		//	clear then append all
 		urlCache = [:]
 		
@@ -114,20 +88,64 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 			return [:]
 		}
 
-		contents.forEach{ self.append($0) }
+		contents.forEach
+		{
+			self.OnFileWritten($0) 
+		}
 		//	append shouldn't have cleared this
 		return urlCache!// ?? [:]
 	}
 
-	private func startMonitoringIfNeeded()
+	private func Open(path: String) throws -> Int32
 	{
-		guard monitor == nil else { return }
+		let fd = open(path, O_EVTONLY)
+		guard fd >= 0 else
+		{
+			let errorCode = errno
+			let errorDescription = String(cString: strerror(errorCode))
+			throw DictionaryCacheError("Failed to open path (\(path)) for monitoring: \(errorDescription) (errno=\(errorCode))")
+		}
+		return fd
+	}
 
-		//	The folder must exist before we can open a file-descriptor on it.
-		try? FileManager.default.createDirectory(at: directoryUrl, withIntermediateDirectories: true)
+	private func StartMonitoringIfNeeded() throws
+	{
+		guard monitor == nil else 
+		{
+			return 
+		}
 
-		let fd = open(directoryUrl.path, O_EVTONLY)
-		guard fd >= 0 else { return }
+		//	ensure directory exists
+		do
+		{
+			//	The folder must exist before we can open a file-descriptor on it.
+			//	This will throw if a file already exists at this path, or if there are permission issues
+			try FileManager.default.createDirectory(at: directoryUrl, withIntermediateDirectories: true)
+		}
+		catch CocoaError.fileWriteFileExists
+		{
+			//	Check if it's a directory (OK) or a file (error)
+			var isDirectory: ObjCBool = false
+			if FileManager.default.fileExists(atPath: directoryUrl.path, isDirectory: &isDirectory)
+			{
+				if isDirectory.boolValue
+				{
+					//	Directory already exists, this is fine - don't throw
+				}
+				else
+				{
+					//	A file exists at this path where we need a directory
+					throw DictionaryCacheError("Cannot create directory at \(directoryUrl.path): a file already exists at this location")
+				}
+			}
+		}
+		catch
+		{
+			//	Throw other errors (permissions, disk full, etc.) as we need this directory to exist
+			throw error
+		}
+			
+		let fd = try Open(path: directoryUrl.path)
 
 		let source = DispatchSource.makeFileSystemObjectSource(
 			fileDescriptor: fd,
@@ -135,11 +153,17 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 			queue: .global(qos: .utility)
 		)
 
-		source.setEventHandler { [weak self] in
-			Task { await self?.invalidate() }
+		source.setEventHandler 
+		{
+			[weak self] in
+			Task 
+			{
+				await self?.OnFileWrittenDeletedOrRenamed() 
+			}
 		}
 
-		source.setCancelHandler {
+		source.setCancelHandler 
+		{
 			close(fd)
 		}
 
@@ -188,7 +212,7 @@ public extension DirectoryCache
 		try fileContents.write(to: fileUrl, options: .atomic)
 		
 		//	Keep the directory cache up-to-date without triggering a re-scan.
-		append(fileUrl)
+		OnFileWritten(fileUrl)
 		return fileUrl
 	}
 }
