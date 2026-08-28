@@ -21,16 +21,15 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 	//	nil means the cache is dirty next request will re-enumerate
 	private var urlCache : [UrlKey:URL]? = nil
 	private var monitor : DispatchSourceFileSystemObject? = nil
-	
+	private(set) var monitoringError : Error?
 	
 	public var urlsWithKeys : [UrlKey:URL]	{	return urlCache ?? ReadDirectory()	}
 	public var urls : [URL]					{	Array(urlsWithKeys.values)	}
 	public var urlKeys : Set<UrlKey>		{	Set(urlsWithKeys.keys)	}
 
-	public init(directoryUrl: URL) throws
+	public init(directoryUrl: URL)
 	{
 		self.directoryUrl = directoryUrl
-		try StartMonitoringIfNeeded()
 	}
 
 	public func GetCachedFileUrl(key:UrlKey) -> URL?
@@ -76,6 +75,8 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 
 	private func ReadDirectory() -> [UrlKey:URL]
 	{
+		StartMonitoringIfNeeded()
+
 		//	clear then append all
 		urlCache = [:]
 		
@@ -96,37 +97,47 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 		return urlCache!// ?? [:]
 	}
 
-	private func Open(path: String) throws -> Int32
-	{
-		let fd = open(path, O_EVTONLY)
-		guard fd >= 0 else
-		{
-			let errorCode = errno
-			let errorDescription = String(cString: strerror(errorCode))
-			throw DictionaryCacheError("Failed to open path (\(path)) for monitoring: \(errorDescription) (errno=\(errorCode))")
-		}
-		return fd
-	}
-
-	private func StartMonitoringIfNeeded() throws
+	
+	func StartMonitoringIfNeeded()
 	{
 		guard monitor == nil else 
 		{
 			return 
 		}
+		do
+		{
+			self.monitor = try Self.StartDirectoryMonitor(directory: directoryUrl)
+			{
+				[weak self] in
+				Task 
+				{
+					await self?.OnFileWrittenDeletedOrRenamed() 
+				}
+			}
+			print("Monitoring \(self.directoryUrl.absoluteString).")
+			self.monitoringError = nil
+		}
+		catch
+		{
+			print("Failed to start monitoring \(self.directoryUrl.absoluteString); \(error.localizedDescription)")
+			self.monitoringError = error
+		}
+	}
 
+	static func StartDirectoryMonitor(directory:URL,OnFileWrittenDeletedOrRenamed:@escaping()->Void) throws -> DispatchSourceFileSystemObject 
+	{
 		//	ensure directory exists
 		do
 		{
 			//	The folder must exist before we can open a file-descriptor on it.
 			//	This will throw if a file already exists at this path, or if there are permission issues
-			try FileManager.default.createDirectory(at: directoryUrl, withIntermediateDirectories: true)
+			try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 		}
 		catch CocoaError.fileWriteFileExists
 		{
 			//	Check if it's a directory (OK) or a file (error)
 			var isDirectory: ObjCBool = false
-			if FileManager.default.fileExists(atPath: directoryUrl.path, isDirectory: &isDirectory)
+			if FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory)
 			{
 				if isDirectory.boolValue
 				{
@@ -135,7 +146,7 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 				else
 				{
 					//	A file exists at this path where we need a directory
-					throw DictionaryCacheError("Cannot create directory at \(directoryUrl.path): a file already exists at this location")
+					throw DictionaryCacheError("Cannot create directory at \(directory.path): a file already exists at this location")
 				}
 			}
 		}
@@ -144,8 +155,20 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 			//	Throw other errors (permissions, disk full, etc.) as we need this directory to exist
 			throw error
 		}
-			
-		let fd = try Open(path: directoryUrl.path)
+		
+		func Open(path: String) throws -> Int32
+		{
+			let fd = open(path, O_EVTONLY)
+			guard fd >= 0 else
+			{
+				let errorCode = errno
+				let errorDescription = String(cString: strerror(errorCode))
+				throw DictionaryCacheError("Failed to open path (\(path)) for monitoring: \(errorDescription) (errno=\(errorCode))")
+			}
+			return fd
+		}
+		//	open directory file descriptor for monitoring
+		let fd = try Open(path: directory.path)
 
 		let source = DispatchSource.makeFileSystemObjectSource(
 			fileDescriptor: fd,
@@ -153,13 +176,9 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 			queue: .global(qos: .utility)
 		)
 
-		source.setEventHandler 
+		source.setEventHandler
 		{
-			[weak self] in
-			Task 
-			{
-				await self?.OnFileWrittenDeletedOrRenamed() 
-			}
+			OnFileWrittenDeletedOrRenamed()
 		}
 
 		source.setCancelHandler 
@@ -167,8 +186,8 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 			close(fd)
 		}
 
-		monitor = source
 		source.resume()
+		return source
 	}
 }
 
