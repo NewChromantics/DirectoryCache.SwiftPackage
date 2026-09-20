@@ -13,6 +13,83 @@ public protocol UrlCacheKey : Hashable
 	init?(fileUrl:URL)
 }
 
+
+public class DirectoryMonitor
+{
+	var onEvent : ()->Void
+	var object : DispatchSourceFileSystemObject
+	
+	public init(directory:URL,watchEvents:DispatchSource.FileSystemEvent,onEvent:@escaping()->Void) throws
+	{
+		self.onEvent = onEvent
+
+		//	ensure directory exists
+		do
+		{
+			//	The folder must exist before we can open a file-descriptor on it.
+			//	This will throw if a file already exists at this path, or if there are permission issues
+			try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+		}
+		catch CocoaError.fileWriteFileExists
+		{
+			//	Check if it's a directory (OK) or a file (error)
+			var isDirectory: ObjCBool = false
+			if FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory)
+			{
+				if isDirectory.boolValue
+				{
+					//	Directory already exists, this is fine - don't throw
+				}
+				else
+				{
+					//	A file exists at this path where we need a directory
+					throw DictionaryCacheError("Cannot create directory at \(directory.path): a file already exists at this location")
+				}
+			}
+		}
+		catch
+		{
+			//	Throw other errors (permissions, disk full, etc.) as we need this directory to exist
+			throw error
+		}
+		
+		func Open(path: String) throws -> Int32
+		{
+			let fd = open(path, O_EVTONLY)
+			guard fd >= 0 else
+			{
+				let errorCode = errno
+				let errorDescription = String(cString: strerror(errorCode))
+				throw DictionaryCacheError("Failed to open path (\(path)) for monitoring: \(errorDescription) (errno=\(errorCode))")
+			}
+			return fd
+		}
+		//	open directory file descriptor for monitoring
+		let fd = try Open(path: directory.path)
+		
+		let source = DispatchSource.makeFileSystemObjectSource(
+			fileDescriptor: fd,
+			eventMask: watchEvents,
+			queue: .global(qos: .utility)
+		)
+		
+		source.setEventHandler
+		{
+			onEvent()
+		}
+		
+		source.setCancelHandler 
+		{
+			close(fd)
+		}
+		
+		source.resume()
+		self.object = source
+	}
+}
+
+
+
 // Watches a directory on disk and maintains a cached list of its file urls
 public actor DirectoryCache<UrlKey:UrlCacheKey>
 {
@@ -20,7 +97,8 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 
 	//	nil means the cache is dirty next request will re-enumerate
 	private var urlCache : [UrlKey:URL]? = nil
-	private var monitor : DispatchSourceFileSystemObject? = nil
+	private var writeMonitor : DirectoryMonitor? = nil
+	private var deleteMonitor : DirectoryMonitor? = nil
 	private(set) var monitoringError : Error?
 	
 	public var urlsWithKeys : [UrlKey:URL]	{	return urlCache ?? ReadDirectory()	}
@@ -67,15 +145,21 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 
 	
 	//	Drop the entire cached list. The next call to `urls()` will re-scan.
-	func OnFileWrittenDeletedOrRenamed()
+	func OnUnknownFileDeletedOrRenamed()
 	{
 		urlCache = nil
+	}
+	
+	func OnUnknownFileWritten()
+	{
+		//	skipping re-read as we're updating written files ourselves
 	}
 
 
 	private func ReadDirectory() -> [UrlKey:URL]
 	{
-		StartMonitoringIfNeeded()
+		StartWriteMonitor()
+		StartDeleteMonitor()
 
 		//	clear then append all
 		urlCache = [:]
@@ -98,20 +182,20 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 	}
 
 	
-	func StartMonitoringIfNeeded()
+	func StartWriteMonitor()
 	{
-		guard monitor == nil else 
+		guard writeMonitor == nil else 
 		{
 			return 
 		}
 		do
 		{
-			self.monitor = try Self.StartDirectoryMonitor(directory: directoryUrl)
+			self.writeMonitor = try DirectoryMonitor(directory: directoryUrl, watchEvents: [.write])
 			{
 				[weak self] in
 				Task 
 				{
-					await self?.OnFileWrittenDeletedOrRenamed() 
+					await self?.OnUnknownFileWritten() 
 				}
 			}
 			print("Monitoring \(self.directoryUrl.absoluteString).")
@@ -124,71 +208,32 @@ public actor DirectoryCache<UrlKey:UrlCacheKey>
 		}
 	}
 
-	static func StartDirectoryMonitor(directory:URL,OnFileWrittenDeletedOrRenamed:@escaping()->Void) throws -> DispatchSourceFileSystemObject 
+	func StartDeleteMonitor()
 	{
-		//	ensure directory exists
+		guard deleteMonitor == nil else 
+		{
+			return 
+		}
 		do
 		{
-			//	The folder must exist before we can open a file-descriptor on it.
-			//	This will throw if a file already exists at this path, or if there are permission issues
-			try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-		}
-		catch CocoaError.fileWriteFileExists
-		{
-			//	Check if it's a directory (OK) or a file (error)
-			var isDirectory: ObjCBool = false
-			if FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory)
+			self.deleteMonitor = try DirectoryMonitor(directory: directoryUrl, watchEvents: [.delete,.rename])
 			{
-				if isDirectory.boolValue
+				[weak self] in
+				Task 
 				{
-					//	Directory already exists, this is fine - don't throw
-				}
-				else
-				{
-					//	A file exists at this path where we need a directory
-					throw DictionaryCacheError("Cannot create directory at \(directory.path): a file already exists at this location")
+					await self?.OnUnknownFileDeletedOrRenamed() 
 				}
 			}
+			print("Monitoring \(self.directoryUrl.absoluteString).")
+			self.monitoringError = nil
 		}
 		catch
 		{
-			//	Throw other errors (permissions, disk full, etc.) as we need this directory to exist
-			throw error
+			print("Failed to start monitoring \(self.directoryUrl.absoluteString); \(error.localizedDescription)")
+			self.monitoringError = error
 		}
-		
-		func Open(path: String) throws -> Int32
-		{
-			let fd = open(path, O_EVTONLY)
-			guard fd >= 0 else
-			{
-				let errorCode = errno
-				let errorDescription = String(cString: strerror(errorCode))
-				throw DictionaryCacheError("Failed to open path (\(path)) for monitoring: \(errorDescription) (errno=\(errorCode))")
-			}
-			return fd
-		}
-		//	open directory file descriptor for monitoring
-		let fd = try Open(path: directory.path)
-
-		let source = DispatchSource.makeFileSystemObjectSource(
-			fileDescriptor: fd,
-			eventMask: [.write, .delete, .rename],
-			queue: .global(qos: .utility)
-		)
-
-		source.setEventHandler
-		{
-			OnFileWrittenDeletedOrRenamed()
-		}
-
-		source.setCancelHandler 
-		{
-			close(fd)
-		}
-
-		source.resume()
-		return source
 	}
+	
 }
 
 //	helpful extensions
